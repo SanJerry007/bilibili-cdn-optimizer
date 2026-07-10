@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站CDN优选 (海外就近 · Akamai优先)
 // @name:en      Bilibili CDN Optimizer (nearest overseas)
-// @namespace    dz-bili-cdn-optimizer
+// @namespace    https://github.com/SanJerry007
 // @version      1.1
 // @description  强制B站视频/番剧走就近的海外Akamai CDN节点,避免被B站随机调度到慢节点(腾讯云远端/国内)。装一次,之后每个视频自动满速。
 // @author       SanJerry007
