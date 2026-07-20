@@ -1,6 +1,6 @@
 # B站 CDN 优选 · Bilibili CDN Optimizer
 
-> 让海外用户看 B 站不再卡 —— 一个油猴脚本，强制视频走**就近的海外 CDN 节点**，告别 B 站的随机慢调度。
+> 让海外用户看 B 站不再卡：一个油猴脚本，强制视频走**就近的海外 CDN 节点**，告别 B 站的随机慢调度。
 >
 > A userscript that forces Bilibili videos onto the **nearest overseas CDN**, fixing slow/buffering playback for viewers outside mainland China.
 
@@ -32,8 +32,8 @@ B 站每次播放会从多个 CDN 镜像里给你分配一个。对海外 IP，�
 
 三层兜底保证视频永远能放：**实测赢家 → PREFER 就近节点 → B 站原始默认**。
 
-- ✅ **不伪造、不篡改地址** —— 只在 B 站*本来就给你的*合法镜像里择优
-- ✅ **不需要 VPN** —— 直连即可满速
+- ✅ **不伪造、不篡改地址**：只在 B 站*本来就给你的*合法镜像里择优
+- ✅ **不需要 VPN**：直连即可满速
 - ✅ **零配置开箱即用**
 - ✅ 兼容 Bilibili-Evolved、下载助手等其它脚本，各自独立运行
 
@@ -81,7 +81,7 @@ const CFG = {
 
 ### The problem
 
-Watching Bilibili from overseas, everything loads fast **except the video itself**, which buffers endlessly. The bottleneck isn't your bandwidth — it's Bilibili's **CDN routing**.
+Watching Bilibili from overseas, everything loads fast **except the video itself**, which buffers endlessly. The bottleneck isn't your bandwidth; it's Bilibili's **CDN routing**.
 
 For each playback, Bilibili hands your player one CDN mirror out of several. For overseas IPs the choice is effectively **random**, and you may land on:
 
@@ -89,13 +89,13 @@ For each playback, Bilibili hands your player one CDN mirror out of several. For
 - 🟡 a farther overseas relay → mediocre
 - 🔴 a **mainland-China node** (data crosses the Pacific, sometimes via Europe) → 200ms+ latency, constant buffering
 
-The key fact: **the fast nearby mirror is already in the list Bilibili returns** — it just isn't picked first.
+The key fact: **the fast nearby mirror is already in the list Bilibili returns**; it just isn't picked first.
 
 ### What this script does
 
 It intercepts Bilibili's `playurl` API response and **promotes the nearest overseas CDN (default: Akamai `akamaized.net`) to the top** of the mirror list, so the player uses it.
 
-- ✅ No spoofing — only reorders the *legitimate* mirrors Bilibili already gave you
+- ✅ No spoofing; only reorders the *legitimate* mirrors Bilibili already gave you
 - ✅ No VPN required
 - ✅ Zero-config out of the box
 - ✅ Coexists with Bilibili-Evolved and other userscripts
@@ -103,7 +103,7 @@ It intercepts Bilibili's `playurl` API response and **promotes the nearest overs
 ### Install
 
 1. Install a userscript manager: [Tampermonkey](https://www.tampermonkey.net/)
-2. **[Click to install the script](https://raw.githubusercontent.com/SanJerry007/bilibili-cdn-optimizer/main/bilibili-cdn-optimizer.user.js)** — Tampermonkey opens an install page; click *Install*.
+2. **[Click to install the script](https://raw.githubusercontent.com/SanJerry007/bilibili-cdn-optimizer/main/bilibili-cdn-optimizer.user.js)**; Tampermonkey opens an install page; click *Install*.
 3. Open any Bilibili video; a blue toast `✅ CDN已优选: ...akamaized.net` in the bottom-right confirms it works.
 
 ### Customize
