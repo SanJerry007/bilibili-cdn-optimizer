@@ -25,12 +25,12 @@ B 站每次播放会从多个 CDN 镜像里给你分配一个。对海外 IP，�
 
 ### 这个脚本怎么解决？
 
-脚本拦截 B 站的 `playurl` 播放接口响应，在它返回的多个 CDN 镜像里**选一个最快的**给播放器用。有两种工作模式：
+脚本从两处拿到 B 站给的播放地址列表，在它返回的多个 CDN 镜像里**选一个最快的**给播放器用：一是页面 HTML 里内联的 `window.__playinfo__`（打开视频页时首个视频走这条路），二是 `playurl` 接口的响应（切清晰度、站内跳转时走这条路）。有两种工作模式：
 
-- **`auto` 实测择优（默认，推荐）**：拦到播放地址后，**在后台并发对每个 CDN 镜像下载一小块（256KB）实测真实速度，选实测最快的那个**。结果缓存 10 分钟，之后同一会话的视频/拖进度条直接复用，不重复测速。测速不阻塞播放（首个视频先用就近 Akamai 兜底，测完自动切最优）。
+- **`auto` 实测择优（默认，推荐）**：拦到播放地址后，**在后台并发对每个 CDN 镜像下载一小块（256KB）实测真实速度，选实测最快的那个**。结果缓存 10 分钟，之后同一会话的视频/拖进度条直接复用，不重复测速。测速不阻塞播放（测速期间先用就近 Akamai 兜底，测完自动切最优）。
 - **`prefer` 固定优先（省流量）**：不测速，直接把指定的就近 CDN（默认 Akamai `akamaized.net`）提到第一位。
 
-三层兜底保证视频永远能放：**实测赢家 → PREFER 就近节点 → B 站原始默认**。
+三层兜底保证视频永远能放：**实测赢家 → PREFER 就近节点 → B 站原始默认**。此外，如果播放器刚拿到某个 CDN 就立刻回头重新要地址，说明那个节点根本播不动，脚本会把它暂时拉黑 5 分钟并改选别的，避免同一个坏节点被反复推到首位、把播放器卡在无限重试里。
 
 - ✅ **不伪造、不篡改地址**：只在 B 站*本来就给你的*合法镜像里择优
 - ✅ **不需要 VPN**：直连即可满速
@@ -93,7 +93,7 @@ The key fact: **the fast nearby mirror is already in the list Bilibili returns**
 
 ### What this script does
 
-It intercepts Bilibili's `playurl` API response and **promotes the nearest overseas CDN (default: Akamai `akamaized.net`) to the top** of the mirror list, so the player uses it.
+It reads the mirror list from both the inline `window.__playinfo__` in the page HTML and the `playurl` API response, then **promotes the nearest overseas CDN (default: Akamai `akamaized.net`) to the top** of the mirror list, so the player uses it.
 
 - ✅ No spoofing; only reorders the *legitimate* mirrors Bilibili already gave you
 - ✅ No VPN required

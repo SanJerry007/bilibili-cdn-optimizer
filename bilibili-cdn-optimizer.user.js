@@ -2,7 +2,7 @@
 // @name         B站CDN优选 (海外就近 · 实测择优)
 // @name:en      Bilibili CDN Optimizer (auto speed-test)
 // @namespace    https://github.com/SanJerry007
-// @version      2.0
+// @version      2.1
 // @description  海外看B站不卡:自动实测所有CDN镜像的真实速度,选最快的用。测速失败时回退到就近Akamai节点。不伪造地址、不需VPN。
 // @author       SanJerry007
 // @homepageURL  https://github.com/SanJerry007/bilibili-cdn-optimizer
@@ -31,6 +31,10 @@
     TEST_TIMEOUT: 4000,
     // 测速结果缓存时长(ms),期间不重测。默认10分钟
     CACHE_TTL: 10 * 60 * 1000,
+    // 播放器刚拿到地址就重新请求 playurl,视为该 CDN 播不动。判定窗口(ms)
+    RETRY_WINDOW: 15000,
+    // 判定失败后,该 CDN 暂时不再被选中的时长(ms)
+    BAN_TTL: 5 * 60 * 1000,
     // 角标提示(用熟后可改 false)
     SHOW_TOAST: true,
   };
@@ -45,6 +49,21 @@
   let winner = null;
   let testing = false;
   function cacheValid() { return winner && (Date.now() - winner.ts) < CFG.CACHE_TTL; }
+
+  // 播不动的 CDN 黑名单: host -> 解禁时间戳
+  const banned = new Map();
+  function isBanned(host) {
+    const until = banned.get(host);
+    if (!until) return false;
+    if (Date.now() >= until) { banned.delete(host); return false; }
+    return true;
+  }
+  function ban(host) {
+    if (!host) return;
+    banned.set(host, Date.now() + CFG.BAN_TTL);
+    if (winner && winner.host === host) winner = null;
+    log('%c该 CDN 播不动,暂时屏蔽 ' + host, 'color:#d9534f;font-weight:bold');
+  }
 
   function uniqueByHost(urls) {
     const seen = new Set(), out = [];
@@ -65,10 +84,17 @@
       fetch(url + sep + '_sp=' + t0.toFixed(0), {
         method: 'GET',
         headers: { 'Range': 'bytes=0-' + (CFG.TEST_BYTES - 1) },
-        signal: ctrl.signal, credentials: 'omit', cache: 'no-store',
-      }).then(r => r.arrayBuffer()).then(buf => {
+        signal: ctrl.signal, cache: 'no-store',
+      }).then(r => {
+        // 403/404/5xx 也会正常 resolve,其错误页有长度,不判状态码就会被当成"测到速了"
+        if (!r.ok) { clearTimeout(timer); ctrl.abort(); resolve(-1); return null; }
+        return r.arrayBuffer();
+      }).then(buf => {
+        if (buf === null) return;
         clearTimeout(timer);
         const dt = performance.now() - t0;
+        // 没下满说明连接被中途掐断,不算成功
+        if (buf.byteLength < CFG.TEST_BYTES) { resolve(-1); return; }
         resolve(dt > 0 ? buf.byteLength / dt : -1);
       }).catch(() => { clearTimeout(timer); resolve(-1); });
     });
@@ -77,8 +103,9 @@
   // 并发测所有镜像,写入 winner
   function runSpeedTest(urls) {
     if (testing) return;
-    const cands = uniqueByHost(urls);
-    if (cands.length <= 1) { if (cands[0]) winner = { host: cands[0].host, ts: Date.now() }; return; }
+    const cands = uniqueByHost(urls).filter(c => !isBanned(c.host));
+    // 只有一个候选时不设 winner: 没测过就不能声称"实测最快"
+    if (cands.length <= 1) return;
     testing = true;
     log('开始测速', cands.length, '个CDN镜像 ...');
     Promise.all(cands.map(c => probe(c.url).then(speed => ({ host: c.host, speed }))))
@@ -91,15 +118,20 @@
           winner = { host: valid[0].host, ts: Date.now() };
           log('%c最快 -> ' + winner.host, 'color:#28a745;font-weight:bold');
           if (CFG.SHOW_TOAST) toast(winner.host, true, true);
+        } else {
+          log('%c所有镜像均测速失败,交回 B站默认顺序', 'color:#d9534f');
         }
       })
       .finally(() => { testing = false; });
   }
 
-  // 挑最优: 实测赢家 > PREFER兜底 > 第一个
+  // 挑最优: 实测赢家 > PREFER兜底 > 第一个。全程跳过黑名单
   function pickBest(urls) {
-    const valid = urls.filter(Boolean);
+    let valid = urls.filter(Boolean);
     if (!valid.length) return null;
+    const alive = valid.filter(u => !isBanned(hostOf(u)));
+    // 全被屏蔽说明判断过头了,清空重来,别把播放器逼到无路可走
+    if (!alive.length) { banned.clear(); } else { valid = alive; }
     if (CFG.MODE === 'auto' && cacheValid()) {
       const hit = valid.find(u => hostOf(u) === winner.host);
       if (hit) return hit;
@@ -131,8 +163,13 @@
     if ('backup_url' in s) s.backup_url = others;
   }
 
+  let lastPickTs = 0;
+
   function processData(json) {
     try {
+      // 播放器刚拿到地址就回来重新要,说明上次给它的 CDN 播不动。
+      // 不记这一笔,下面每一轮都会把同一个坏 CDN 重新推到首位,变成死循环重试。
+      if (lastPicked && (Date.now() - lastPickTs) < CFG.RETRY_WINDOW) ban(lastPicked);
       const d = (json && (json.data || json.result)) ? (json.data || json.result) : json;
       if (!d) return json;
       const videoUrls = [];
@@ -157,6 +194,7 @@
       if (CFG.MODE === 'auto' && !cacheValid() && videoUrls.length > 1) runSpeedTest(videoUrls);
       if (lastPicked) {
         const isWinner = cacheValid() && lastPicked === winner.host;
+        lastPickTs = Date.now();
         log('本次选用 -> ' + lastPicked + (isWinner ? ' (实测最快)' : ' (兜底/测速中)'));
         if (CFG.SHOW_TOAST) toast(lastPicked, preferHit(lastPicked) || isWinner, false);
       }
@@ -164,7 +202,13 @@
     return json;
   }
 
-  const isPlayurl = (url) => typeof url === 'string' && url.indexOf('playurl') !== -1;
+  // 只认接口路径。切勿用子串匹配: 每条媒体分片地址里都带 gen=playurlv3,
+  // 子串匹配会命中所有分片请求而漏掉真正的 playurl 接口。
+  function isPlayurl(url) {
+    if (typeof url !== 'string' || !url) return false;
+    try { return /\/playurl(?:\/|$)/.test(new URL(url, location.href).pathname); }
+    catch (e) { return false; }
+  }
 
   // ---- hook fetch ----
   const _fetch = window.fetch;
@@ -198,6 +242,22 @@
     return _open.apply(this, arguments);
   };
 
+  // ---- 拦截 window.__playinfo__ ----
+  // 首个视频的播放地址是 B站直接内联在页面 HTML 里的,根本不走 fetch/XHR。
+  // 只钩 fetch/XHR 的话,打开一个视频页时这个脚本实际上什么都没做。
+  var _playinfo;
+  try {
+    Object.defineProperty(window, '__playinfo__', {
+      configurable: true,
+      enumerable: true,
+      get: function () { return _playinfo; },
+      set: function (v) {
+        try { if (v) processData(v); } catch (e) { console.warn('[B站CDN优选] __playinfo__ 处理异常', e); }
+        _playinfo = v;
+      },
+    });
+  } catch (e) { console.warn('[B站CDN优选] 无法拦截 __playinfo__', e); }
+
   // ---- 角标提示 ----
   let toastEl = null, toastTimer = null;
   function toast(host, ok, isTestResult) {
@@ -220,5 +280,5 @@
     } catch (e) {}
   }
 
-  log('已加载 v2.0 · 模式: ' + CFG.MODE + ' · 兜底优先: ' + CFG.PREFER.join(', '));
+  log('已加载 v2.1 · 模式: ' + CFG.MODE + ' · 兜底优先: ' + CFG.PREFER.join(', '));
 })();
