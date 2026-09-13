@@ -60,6 +60,12 @@ function newCtx(store, profiles) {
     document: {
       body: { appendChild() {} },
       addEventListener() {},
+      // the script waits for the player to have buffered before probing; __bufferAhead drives that
+      querySelector: (sel) => {
+        if (sel !== 'video') return null;
+        if (ctx.__bufferAhead == null) return null;
+        return { currentTime: 0, buffered: { length: 1, end: () => ctx.__bufferAhead } };
+      },
       createElement: () => {
         const el = { style: { cssText: '' } };
         // capture what the badge last said, so tests can assert on the user-visible text
@@ -71,6 +77,7 @@ function newCtx(store, profiles) {
       },
     },
     __lastToast: '',
+    __bufferAhead: 30,
     fetchCalls: [],
     __logs: logs,
   };
@@ -127,6 +134,9 @@ const BURST_THEN_CRAWL = [
 const UNIFORM_FAST = [{ bytes: 64 * KB, dtMs: 0.5 }];
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+// the script defers probing until the player has buffered (CFG.TEST_DELAY_MS = 2000ms),
+// so any test that expects a completed speed test has to wait past that gate
+const SETTLE = 2800;
 
 (async () => {
   console.log('\n== T1: the probe must measure SUSTAINED throughput, not the opening burst ==');
@@ -136,7 +146,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     const ctx = newCtx(store, { [HOST_PREFER]: BURST_THEN_CRAWL, [HOST_FAST]: UNIFORM_FAST });
     const p = payload();
     ctx.window.__playinfo__ = p;
-    await sleep(400);
+    await sleep(SETTLE);
     const line = ctx.__logs.find(l => l.includes('测速结果'));
     ok('speed test ran', !!line, ctx.__logs.join(' | ').slice(0, 300));
     if (line) {
@@ -223,7 +233,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     const ctx = newCtx(store, { [HOST_PREFER]: UNIFORM_FAST, [HOST_FAST]: 'fail' });
     const p = payload();
     ctx.window.__playinfo__ = p;
-    await sleep(400);
+    await sleep(SETTLE);
     ok('failing host was banned', ctx.__logs.some(l => l.includes('暂时屏蔽') && l.includes(HOST_FAST)), ctx.__logs.filter(l => l.includes('屏蔽')).join('|'));
     ok('winner is the surviving host', (store.getItem('bcdn:winner:v3') || '').includes(HOST_PREFER), store.getItem('bcdn:winner:v3'));
   }
@@ -239,7 +249,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     // audio can ONLY use HOST_PREFER, so after the test video and audio land on different hosts
     p.data.dash.audio = [{ baseUrl: `https://${HOST_PREFER}/a.m4s?x=1`, backupUrl: [] }];
     ctx.window.__playinfo__ = p;
-    await sleep(400);
+    await sleep(SETTLE);
     const line = ctx.__logs.find(l => l.includes('已改写播放地址对象'));
     ok('rewrite was announced', !!line, ctx.__logs.join(' | ').slice(0, 300));
     ok('announcement names the video host', !!line && line.includes(HOST_FAST), line);
@@ -257,7 +267,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     xhr.open('GET', 'https://api.bilibili.com/x/player/playurl?avid=1');
     xhr.__raw = JSON.stringify(payload());
     void xhr.responseText;
-    await sleep(400);
+    await sleep(SETTLE);
     ok('speed test still ran', ctx.fetchCalls.length > 0, 'fetches: ' + ctx.fetchCalls.length);
     ok('winner still saved for next time', (store.getItem('bcdn:winner:v3') || '').includes(HOST_FAST), store.getItem('bcdn:winner:v3'));
     ok('does NOT claim it rewrote the live payload', !ctx.__logs.some(l => l.includes('已改写播放地址对象')), '');
@@ -272,7 +282,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     const TINY = { finite: [{ bytes: 64 * KB, dtMs: 1 }] };
     const ctx = newCtx(store, { [HOST_PREFER]: TINY, [HOST_FAST]: TINY });
     ctx.window.__playinfo__ = payload();
-    await sleep(400);
+    await sleep(SETTLE);
     ok('no mirror was banned', !ctx.__logs.some(l => l.includes('暂时屏蔽')), ctx.__logs.filter(l => l.includes('屏蔽')).join(' | '));
     ok('reported as unmeasurable, not FAIL', ctx.__logs.some(l => l.includes('测不出')), ctx.__logs.find(l => l.includes('测速结果')) || '');
     ok('no winner invented from a non-reading', !store.getItem('bcdn:winner:v3'), store.getItem('bcdn:winner:v3'));
@@ -284,11 +294,13 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     const store = makeStore();
     const ctx = newCtx(store, { [HOST_PREFER]: 'fail', [HOST_FAST]: 'fail' });
     ctx.window.__playinfo__ = payload();
-    await sleep(400);
+    await sleep(SETTLE);
     const first = ctx.fetchCalls.length;
     ok('first round probed both mirrors', first === 2, 'fetches: ' + first);
     ctx.window.__playinfo__ = payload();
-    await sleep(200);
+    // must wait past the defer gate too, otherwise "no re-probe" would pass merely because the
+    // deferred tick had not fired yet, which proves nothing about the cooldown
+    await sleep(SETTLE);
     ok('second payload did not re-probe', ctx.fetchCalls.length === first, `${first} -> ${ctx.fetchCalls.length}`);
     ok('and said why', ctx.__logs.some(l => l.includes('冷却中')), ctx.__logs.slice(-3).join(' | '));
   }
@@ -318,7 +330,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     store.setItem('bcdn:winner:v3', JSON.stringify({ host: 'elsewhere.example.net', kbps: 900000, ts: Date.now() }));
     const ctx = newCtx(store, { [HOST_PREFER]: BURST_THEN_CRAWL, [HOST_FAST]: UNIFORM_FAST });
     ctx.window.__playinfo__ = payload();
-    await sleep(400);
+    await sleep(SETTLE);
     ok('the test ran anyway', ctx.fetchCalls.length === 2, 'fetches: ' + ctx.fetchCalls.length);
     ok('winner replaced with one this video actually offers', (store.getItem('bcdn:winner:v3') || '').includes(HOST_FAST), store.getItem('bcdn:winner:v3'));
   }
@@ -333,6 +345,25 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
       const boot = ctx.__logs.find(l => l.includes('已加载')) || '';
       ok('rejected: ' + bad.slice(0, 40), boot.includes('暂无实测结果') && !boot.includes('NaN'), boot);
     }
+  }
+
+  console.log('\n== T15: the probe must wait for the player to buffer before stealing bandwidth ==');
+  {
+    vclock = 0;
+    const store = makeStore();
+    const ctx = newCtx(store, { [HOST_PREFER]: BURST_THEN_CRAWL, [HOST_FAST]: UNIFORM_FAST });
+    ctx.__bufferAhead = 0; // player is still filling its buffer
+    ctx.window.__playinfo__ = payload();
+    ok('nothing probed synchronously', ctx.fetchCalls.length === 0, 'fetches: ' + ctx.fetchCalls.length);
+    await sleep(SETTLE);
+    ok('still nothing probed while the buffer is empty', ctx.fetchCalls.length === 0, 'fetches: ' + ctx.fetchCalls.length);
+    ok('and a pick was still made from the fallback', ctx.__logs.some(l => l.includes('本次选用')), '');
+    ctx.__bufferAhead = 30; // player is satisfied
+    await sleep(1600);
+    ok('probes start once the player has buffered', ctx.fetchCalls.length === 2, 'fetches: ' + ctx.fetchCalls.length);
+    ok('and it says so', ctx.__logs.some(l => l.includes('已缓冲') && l.includes('现在测速')), ctx.__logs.slice(-4).join(' | '));
+    // the TEST_DEFER_MAX_MS escape hatch (45s) is deliberately not exercised here: a CI gate that
+    // sleeps 45 seconds gets deleted. It is covered by reading, not by this harness.
   }
 
   console.log(`\n==== ${pass} passed, ${fail} failed ====`);

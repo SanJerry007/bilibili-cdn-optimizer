@@ -2,7 +2,7 @@
 // @name         B站CDN优选 (海外就近 · 实测择优)
 // @name:en      Bilibili CDN Optimizer (auto speed-test)
 // @namespace    https://github.com/SanJerry007
-// @version      3.1
+// @version      3.2
 // @description  海外看B站不卡:实测每个CDN镜像的持续吞吐,选最快的用,结果跨页面保存并在下次打开视频时立刻生效。不伪造地址、不需VPN。
 // @author       SanJerry007
 // @homepageURL  https://github.com/SanJerry007/bilibili-cdn-optimizer
@@ -45,6 +45,15 @@
     // 两轮测速之间的最小间隔(ms)。没有它的话,「所有镜像都失败」会和 pickBest 里的
     // banned.clear() 组成一个死循环: 清空黑名单 -> 重测 -> 全失败 -> 再清空,每个载荷来一遍。
     TEST_COOLDOWN: 60 * 1000,
+
+    // --- 什么时候开测 ---
+    // 绝对不能在 document-start 就开测。实测同一个 akamai 镜像: 页面加载中测出 5.8 Mbps,
+    // 视频暂停且缓冲满之后再测是 195 到 281 Mbps,差四十倍。测速和播放器的首屏缓冲抢的是
+    // 同一条管子,开在那一刻既量不准,又恰好在最需要带宽的几秒里把带宽抢走。
+    // 所以: 等播放器自己缓冲够了再测。赢家反正是跨页面保存的,晚一点测不影响下个视频。
+    TEST_DELAY_MS: 2000,        // 最早也要等这么久才开始查缓冲
+    TEST_BUFFER_AHEAD_S: 10,    // 缓冲领先播放位置这么多秒,就认为播放器吃饱了
+    TEST_DEFER_MAX_MS: 45000,   // 等不到就别等了,免得永远不测
 
     // 实测结果缓存时长(ms)。跨页面保存,期间不重测
     CACHE_TTL: 10 * 60 * 1000,
@@ -185,6 +194,37 @@
   // 必须串行: 并发测速时几个镜像抢的是同一条出口带宽,每个都只量到一部分,既比不出高下,
   // 又跟播放器自己的缓冲抢带宽。
   let lastTestTs = 0;
+  let deferPending = false;
+
+  // 等播放器吃饱了再测。判据是 video 元素的缓冲领先量,不是固定睡一觉:
+  // 4K 和 360P 填满缓冲要的时间差着数量级,写死一个秒数必然对一头不对另一头。
+  function whenPlayerSettled(run) {
+    if (deferPending) return;
+    deferPending = true;
+    const t0 = Date.now();
+    const tick = () => {
+      let ahead = -1;
+      try {
+        const v = document.querySelector('video');
+        if (v && v.buffered && v.buffered.length) ahead = v.buffered.end(v.buffered.length - 1) - v.currentTime;
+      } catch (e) { /* 没有 video 元素就只靠下面的上限兜底 */ }
+      if (ahead >= CFG.TEST_BUFFER_AHEAD_S) {
+        deferPending = false;
+        log('播放器已缓冲 ' + ahead.toFixed(1) + ' 秒,现在测速');
+        run();
+        return;
+      }
+      if (Date.now() - t0 >= CFG.TEST_DEFER_MAX_MS) {
+        deferPending = false;
+        log('等了 ' + Math.round((Date.now() - t0) / 1000) + ' 秒仍未缓冲到位(当前领先 ' +
+          (ahead < 0 ? '未知' : ahead.toFixed(1) + ' 秒') + '),不再等,开始测速');
+        run();
+        return;
+      }
+      setTimeout(tick, 1000);
+    };
+    setTimeout(tick, CFG.TEST_DELAY_MS);
+  }
 
   async function runSpeedTest(urls) {
     if (testing) return;
@@ -370,7 +410,10 @@
       // 缓存里的赢家不在这个视频给出的镜像里,等于没有结论,照样要测。
       // 只看 cacheValid() 的话,一个存着别处赢家的缓存会把测速压制整整 10 分钟。
       const winnerUsable = cacheValid() && videoUrls.some(u => hostOf(u) === winner.host);
-      if (CFG.MODE === 'auto' && !winnerUsable && videoUrls.length > 1) runSpeedTest(videoUrls);
+      if (CFG.MODE === 'auto' && !winnerUsable && videoUrls.length > 1) {
+        // 注意是 whenPlayerSettled 而不是直接跑,理由见 CFG.TEST_DELAY_MS 那段
+        whenPlayerSettled(() => runSpeedTest(videoUrls));
+      }
     } catch (e) { console.warn('[B站CDN优选] 处理异常', e); }
     return json;
   }
@@ -508,6 +551,6 @@
     } catch (e) {}
   }
 
-  log('已加载 v3.1 · 模式: ' + CFG.MODE + ' · 兜底优先: ' + CFG.PREFER.join(', ') +
+  log('已加载 v3.2 · 模式: ' + CFG.MODE + ' · 兜底优先: ' + CFG.PREFER.join(', ') +
     (cacheValid() ? ' · 沿用上次实测赢家: ' + winner.host + ' (' + mbps(winner.kbps) + ')' : ' · 暂无实测结果'));
 })();
