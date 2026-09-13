@@ -1,0 +1,24 @@
+# Regression gate for the userscript's selection logic.
+#
+# It loads the real bilibili-cdn-optimizer.user.js into a stubbed browser (vm context with a fake
+# fetch / XHR / localStorage / clock) and asserts behaviour, not structure. Every assertion is
+# written so the pre-3.0 script FAILS it: run `node tools/selftest.js <old copy>` and 16 of the 22
+# checks go red. A gate that passes on the broken version would not be a gate.
+name: selftest
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Syntax
+        run: node --check bilibili-cdn-optimizer.user.js
+      - name: Selection logic
+        run: node tools/selftest.js
