@@ -27,7 +27,7 @@ B 站每次播放会从多个 CDN 镜像里给你分配一个。对海外 IP，�
 
 脚本从两处拿到 B 站给的播放地址列表，在它返回的多个 CDN 镜像里**选一个最快的**给播放器用：一是页面 HTML 里内联的 `window.__playinfo__`（打开视频页时首个视频走这条路），二是 `playurl` 接口的响应（切清晰度、站内跳转时走这条路）。有两种工作模式：
 
-- **`auto` 实测择优（默认，推荐）**：拦到播放地址后，在后台**依次**对每个 CDN 镜像实测**持续吞吐**，选最快的那个。测速会丢掉开头的 256KB 或 500ms（那一段是握手加 TCP 慢启动，量到的是延迟不是带宽），只统计之后 1.2 秒窗口里的字节数。结果**跨页面保存** 10 分钟，所以下次打开视频时第一帧就用上了最优源，不用等测速。
+- **`auto` 实测择优（默认，推荐）**：拦到播放地址后，在后台**依次**对每个 CDN 镜像实测**持续吞吐**，选最快的那个。测速会丢掉开头的 256KB 或 500ms（那一段是握手加 TCP 慢启动，量到的是延迟不是带宽），之后才开表。窗口是「最多 1.2 秒或最多 4MB，谁先到算谁」，而在快线路上先到的总是 4MB 那一条（约 26 Mbps 以上就由字节数说了算，200 Mbps 时实际窗口只有 150ms 左右），这是不愿为了凑满 1.2 秒去下几十 MB 的取舍。结果**跨页面保存** 10 分钟，所以下次打开视频时第一帧就用上了最优源，不用等测速。
 - **`prefer` 固定优先（省流量）**：不测速，直接把指定的就近 CDN（默认 Akamai `akamaized.net`）提到第一位。
 
 三层兜底保证视频永远能放：**实测赢家 → PREFER 就近节点 → B 站原始默认**。落选的镜像仍然留在 `backupUrl` 里，播放器自己的故障转移照常可用。只有测速硬失败（403、CORS、超时）的镜像才会被暂时拉黑 5 分钟。
@@ -49,7 +49,7 @@ B 站每次播放会从多个 CDN 镜像里给你分配一个。对海外 IP，�
 ### 验证生效
 
 - 右下角角标显示的是**播放器此刻真正在用的那个 host**。绿色 `🏆 实测最快CDN: xxx (123.4 Mbps)` 表示这个源是实测选出来的，并且带宽数字可以对；蓝色 `⚠️ 用兜底CDN: ...` 表示还没有实测结果，正在用 PREFER 兜底。
-- 按 `F12` 打开控制台，能看到 `[B站CDN优选] 测速结果(持续吞吐):` 列出每个 CDN 的实测 Mbps，以及绿字 `最快 -> ...`。如果赢家跟当前在用的不是同一个，还会看到 `已把播放地址改写为 ...`。
+- 按 `F12` 打开控制台，能看到 `[B站CDN优选] 测速结果(持续吞吐):` 列出每个 CDN 的实测 Mbps，以及绿字 `最快 -> ...`。如果赢家跟当前在用的不是同一个，会看到两种消息之一：`已改写播放地址对象 -> ...` 表示这次真改到了播放器手上的那份数据；`测速结果已保存……从下一个视频起生效` 表示这条路上的地址已经序列化交出去了，本次改不动。**脚本不会在改不动的时候声称自己改了。**
 
 ### 验证脚本本身没退化
 
@@ -57,7 +57,7 @@ B 站每次播放会从多个 CDN 镜像里给你分配一个。对海外 IP，�
 node tools/selftest.js
 ```
 
-它把真实的脚本文件加载进一个桩浏览器（假的 fetch / XHR / localStorage / 时钟），断言的是行为不是结构。22 条断言里有 16 条在 3.0 之前的版本上是红的，所以这个闸门不会对着坏版本打绿灯。CI 每次 push 都跑。
+它把真实的脚本文件加载进一个桩浏览器（假的 fetch / XHR / localStorage / 时钟），断言的是行为不是结构。44 条断言里，31 条在 2.1 上是红的、14 条在 3.0 上是红的，所以这个闸门不会对着坏版本打绿灯。CI 每次 push 都跑。
 
 ### 进阶配置
 
@@ -70,7 +70,9 @@ const CFG = {
   WARMUP_BYTES: 262144,         // 测速丢弃的热身字节数(握手+慢启动,量的是延迟不是带宽)
   WARMUP_MS: 500,               // 热身最长这么久,与上一条谁先到算谁
   MEASURE_MS: 1200,             // 热身之后真正计入速度的测量窗口(ms)
-  MAX_BYTES: 8 * 1024 * 1024,   // 单镜像最多拉这么多就收手
+  MAX_BYTES: 4 * 1024 * 1024,   // 单镜像最多拉这么多就收手,快线路上是它决定窗口长度
+  MAX_MIRRORS: 3,               // 一轮最多测几个镜像,丢掉的会写进控制台
+  TEST_COOLDOWN: 60 * 1000,     // 两轮测速最小间隔,防止全失败时无限重测
   TEST_TIMEOUT: 8000,           // 单镜像整体超时(ms)
   CACHE_TTL: 10 * 60 * 1000,    // 实测结果缓存时长(ms),跨页面保存
   MIN_GAIN: 1.25,               // 要快过在用的这么多倍才换,避免在噪声上横跳
@@ -79,7 +81,9 @@ const CFG = {
 };
 ```
 
-流量代价：每 10 分钟最多测一轮，每个镜像最多拉 8MB。嫌费流量就调小 `MAX_BYTES` 和 `MEASURE_MS`，或者干脆切 `prefer` 模式。
+**这个探针能分辨什么、不能分辨什么**（在一条海外直连线路上，对同一对镜像连测两轮的实测结果）：两个都很快的源之间，读数会抖，一轮 289.5 Mbps 下一轮 139.1 Mbps 都有，`MIN_GAIN` 压不住这种两倍级的抖动，所以它在两个快源之间选谁带一定随机性。这不要紧，因为两个都快。它真正要认出来的是**快源和慢源之间那种量级差**（比如就近节点几百 Mbps 对上境内节点的几百 KB/s），那个差距是几十上百倍，任何一轮都分得清。旧探针连前一种都分不清：同一个源两轮读到 17.3 和 40.1 Mbps，而真值在 139 以上。
+
+流量代价：每 10 分钟最多测一轮，一轮最多 3 个镜像，每个最多 4MB，所以上限是每 10 分钟 12MB。嫌费流量就调小 `MAX_BYTES` 或 `MAX_MIRRORS`（调 `MEASURE_MS` 在快线路上没用，那里先到的是字节数上限），或者干脆切 `prefer` 模式。
 
 - 想省流量、不想每次测速：把 `MODE` 改成 `'prefer'`，它就只按 `PREFER` 固定优选（Akamai 对绝大多数海外地区已是就近节点）。
 - `auto` 模式下 `PREFER` 仍作为测速完成前和测速失败时的兜底。
@@ -104,6 +108,24 @@ const CFG = {
 
 另外，同一份 XHR 响应被读第二次时会把整套逻辑重跑一遍，现在按原始字符串记一次结果；`fetch` 钩子重建响应时会带走对不上的 `content-length`，现在删掉。
 
+### 3.1 修了什么
+
+3.0 发出去之前又做了一轮对抗性复核，结果它自己犯了两个跟 2.x 同类的错，还带出几个新的。
+
+**刚修好的音频覆盖，在 `applyWinner()` 里原样又犯了一遍。** 它遍历所有改写过的流、让最后一个说了算，而最后一个是音频。于是角标又变成报音频的 host。现在只认视频流。
+
+**它在改不动的时候声称自己改了。** `fetch` 和 XHR 两条路在 `processData` 返回后立刻把对象序列化成字符串交给播放器，之后再改那个对象播放器一个字都看不见，可代码照样打印「已把播放地址改写为」。这正是 2.x 那个「只报告意图、不报告结果」的毛病换个地方重演。现在按「这份数据播放器还会不会再读」分开处理，改不动就明说改不动。
+
+**复用同一个 XHR 对象时，无关接口的响应被改了值。** 实例 getter 在 `open()` 到别的地址时不会被摘掉，于是那个响应也被 `JSON.parse` + `JSON.stringify` 转一圈，而 B站的 aid/mid 超出 double 精度，转一圈就变了：测试里 `9007199254740993` 变成 `...992`。现在每次 `open()` 都先摘掉。
+
+**一段很短的片源会让所有健康镜像被拉黑。** 探针把「测不出来」和「硬失败」都返回 -1。现在分成三态，只有硬失败才拉黑。
+
+**全部镜像失败时会无限重测。** `pickBest` 在全员被拉黑时会清空黑名单，清完下一个载荷又重测一轮，每个载荷来一遍。加了 `TEST_COOLDOWN`。
+
+**缓存里存着别处的赢家会把测速压制 10 分钟。** 之前只看缓存新不新，不看那个 host 这个视频到底提不提供。
+
+还有两处小的：坏掉或缺字段的缓存会让角标显示 `NaN Mbps`，现在校验后丢弃；别的脚本若把 `XMLHttpRequest` 换成子类，原型描述符会是 `undefined`，之后每次读属性都抛异常把播放打死，现在拿不到就整个不挂钩 XHR。
+
 ---
 
 ## English
@@ -124,7 +146,7 @@ The key fact: **the fast nearby mirror is already in the list Bilibili returns**
 
 It reads the mirror list from both the inline `window.__playinfo__` in the page HTML and the `playurl` API response, then **measures each mirror's sustained throughput and promotes the fastest one** to the top of the list, so the player uses it.
 
-The measurement discards the first 256KB or 500ms of each transfer, because that window is handshake plus TCP slow start and reflects round-trip time rather than bandwidth. Only the bytes in the following 1.2 second window are counted. Mirrors are probed one at a time, since concurrent probes share the same uplink and would each measure only a fraction of it.
+The measurement discards the first 256KB or 500ms of each transfer, because that window is handshake plus TCP slow start and reflects round-trip time rather than bandwidth. The window that follows is whichever comes first, 1.2 seconds or 4MB, and on fast links it is always the byte cap: above roughly 26 Mbps the window length is set by MAX_BYTES, so at 200 Mbps it is about 150ms. That is a deliberate trade, since honouring 1.2 seconds at those rates would mean downloading tens of megabytes per mirror. Mirrors are probed one at a time, since concurrent probes share the same uplink and would each measure only a fraction of it.
 
 The winner is **persisted across page loads** for 10 minutes, so the next video you open uses it from the very first frame instead of waiting for a fresh measurement.
 
@@ -154,7 +176,7 @@ PREFER: ['akamaized.net'],    // ordered fallback used until a measurement exist
 node tools/selftest.js
 ```
 
-Loads the real userscript into a stubbed browser and asserts behaviour. 16 of the 22 assertions fail on pre-3.0 builds, which is what makes the gate meaningful.
+Loads the real userscript into a stubbed browser and asserts behaviour. Of the 44 assertions, 31 fail on 2.1 and 14 fail on 3.0, which is what makes the gate meaningful.
 
 ### License
 

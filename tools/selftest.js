@@ -26,13 +26,17 @@ function makeStore() {
   };
 }
 
-// chunks: [{bytes, dtMs}, ...] repeated until the reader is cancelled
-function makeBody(chunks) {
+// profile is either [{bytes, dtMs}, ...]  (last chunk repeats, effectively endless)
+// or {finite: [...]}                      (stream ends after the listed chunks)
+function makeBody(profile) {
+  const finite = !Array.isArray(profile);
+  const chunks = finite ? profile.finite : profile;
   let i = 0;
   return {
     getReader() {
       return {
         read() {
+          if (finite && i >= chunks.length) return Promise.resolve({ done: true, value: undefined });
           const c = chunks[Math.min(i, chunks.length - 1)];
           i++;
           if (i > 400) return Promise.resolve({ done: true, value: undefined });
@@ -54,10 +58,19 @@ function newCtx(store, profiles) {
     performance: { now: () => vclock },
     setTimeout, clearTimeout, Promise, URL, Headers, Response, AbortController, Uint8Array, Date, Math, JSON, Set, Map, Array, Object, String, Number,
     document: {
-      body: null,
+      body: { appendChild() {} },
       addEventListener() {},
-      createElement: () => ({ style: { cssText: '' }, textContent: '' }),
+      createElement: () => {
+        const el = { style: { cssText: '' } };
+        // capture what the badge last said, so tests can assert on the user-visible text
+        Object.defineProperty(el, 'textContent', {
+          get() { return ctx.__lastToast || ''; },
+          set(v) { ctx.__lastToast = v; },
+        });
+        return el;
+      },
     },
+    __lastToast: '',
     fetchCalls: [],
     __logs: logs,
   };
@@ -213,6 +226,113 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     await sleep(400);
     ok('failing host was banned', ctx.__logs.some(l => l.includes('暂时屏蔽') && l.includes(HOST_FAST)), ctx.__logs.filter(l => l.includes('屏蔽')).join('|'));
     ok('winner is the surviving host', (store.getItem('bcdn:winner:v3') || '').includes(HOST_PREFER), store.getItem('bcdn:winner:v3'));
+  }
+
+  // ---------- cases added after the 3.0 review; each one is red on 3.0 ----------
+
+  console.log('\n== T8: applyWinner must report the VIDEO host, not the last stream it rewrote ==');
+  {
+    vclock = 0;
+    const store = makeStore();
+    const ctx = newCtx(store, { [HOST_PREFER]: BURST_THEN_CRAWL, [HOST_FAST]: UNIFORM_FAST });
+    const p = payload();
+    // audio can ONLY use HOST_PREFER, so after the test video and audio land on different hosts
+    p.data.dash.audio = [{ baseUrl: `https://${HOST_PREFER}/a.m4s?x=1`, backupUrl: [] }];
+    ctx.window.__playinfo__ = p;
+    await sleep(400);
+    const line = ctx.__logs.find(l => l.includes('已改写播放地址对象'));
+    ok('rewrite was announced', !!line, ctx.__logs.join(' | ').slice(0, 300));
+    ok('announcement names the video host', !!line && line.includes(HOST_FAST), line);
+    ok('video really moved', p.data.dash.video[0].baseUrl.includes(HOST_FAST), p.data.dash.video[0].baseUrl);
+    const badge = ctx.__logs.concat([ctx.__lastToast || '']).join(' | ');
+    ok('badge reports the measured winner, not the audio host', (ctx.__lastToast || '').includes(HOST_FAST), ctx.__lastToast);
+  }
+
+  console.log('\n== T9: on the fetch/XHR paths the payload is already serialized, so do NOT claim a rewrite ==');
+  {
+    vclock = 0;
+    const store = makeStore();
+    const ctx = newCtx(store, { [HOST_PREFER]: BURST_THEN_CRAWL, [HOST_FAST]: UNIFORM_FAST });
+    const xhr = new ctx.XMLHttpRequest();
+    xhr.open('GET', 'https://api.bilibili.com/x/player/playurl?avid=1');
+    xhr.__raw = JSON.stringify(payload());
+    void xhr.responseText;
+    await sleep(400);
+    ok('speed test still ran', ctx.fetchCalls.length > 0, 'fetches: ' + ctx.fetchCalls.length);
+    ok('winner still saved for next time', (store.getItem('bcdn:winner:v3') || '').includes(HOST_FAST), store.getItem('bcdn:winner:v3'));
+    ok('does NOT claim it rewrote the live payload', !ctx.__logs.some(l => l.includes('已改写播放地址对象')), '');
+    ok('says it takes effect from the next video', ctx.__logs.some(l => l.includes('从下一个视频起生效')), ctx.__logs.join(' | ').slice(-300));
+  }
+
+  console.log('\n== T10: "file ended before the window" is not evidence of a bad mirror ==');
+  {
+    vclock = 0;
+    const store = makeStore();
+    // both bodies end after 64KB, well under WARMUP_BYTES
+    const TINY = { finite: [{ bytes: 64 * KB, dtMs: 1 }] };
+    const ctx = newCtx(store, { [HOST_PREFER]: TINY, [HOST_FAST]: TINY });
+    ctx.window.__playinfo__ = payload();
+    await sleep(400);
+    ok('no mirror was banned', !ctx.__logs.some(l => l.includes('暂时屏蔽')), ctx.__logs.filter(l => l.includes('屏蔽')).join(' | '));
+    ok('reported as unmeasurable, not FAIL', ctx.__logs.some(l => l.includes('测不出')), ctx.__logs.find(l => l.includes('测速结果')) || '');
+    ok('no winner invented from a non-reading', !store.getItem('bcdn:winner:v3'), store.getItem('bcdn:winner:v3'));
+  }
+
+  console.log('\n== T11: an all-fail round must not re-probe on every following payload ==');
+  {
+    vclock = 0;
+    const store = makeStore();
+    const ctx = newCtx(store, { [HOST_PREFER]: 'fail', [HOST_FAST]: 'fail' });
+    ctx.window.__playinfo__ = payload();
+    await sleep(400);
+    const first = ctx.fetchCalls.length;
+    ok('first round probed both mirrors', first === 2, 'fetches: ' + first);
+    ctx.window.__playinfo__ = payload();
+    await sleep(200);
+    ok('second payload did not re-probe', ctx.fetchCalls.length === first, `${first} -> ${ctx.fetchCalls.length}`);
+    ok('and said why', ctx.__logs.some(l => l.includes('冷却中')), ctx.__logs.slice(-3).join(' | '));
+  }
+
+  console.log('\n== T12: an XHR reused for a different URL must not be transformed ==');
+  {
+    vclock = 0;
+    const store = makeStore();
+    store.setItem('bcdn:winner:v3', JSON.stringify({ host: HOST_FAST, kbps: 900000, ts: Date.now() }));
+    const ctx = newCtx(store, { [HOST_PREFER]: BURST_THEN_CRAWL, [HOST_FAST]: UNIFORM_FAST });
+    const xhr = new ctx.XMLHttpRequest();
+    xhr.open('GET', 'https://api.bilibili.com/x/player/playurl?avid=1');
+    xhr.__raw = JSON.stringify(payload());
+    void xhr.responseText;
+    // same object, now used for an unrelated API whose ids exceed double precision
+    const other = '{"code":0,"data":{"aid":9007199254740993,"mid":9007199254740995}}';
+    xhr.open('GET', 'https://api.bilibili.com/x/web-interface/view?aid=1');
+    xhr.__raw = other;
+    ok('unrelated response passes through byte for byte', xhr.responseText === other, xhr.responseText);
+    ok('big integers survive', xhr.responseText.includes('9007199254740993'), xhr.responseText);
+  }
+
+  console.log('\n== T13: a cached winner this video does not offer must not suppress the test ==');
+  {
+    vclock = 0;
+    const store = makeStore();
+    store.setItem('bcdn:winner:v3', JSON.stringify({ host: 'elsewhere.example.net', kbps: 900000, ts: Date.now() }));
+    const ctx = newCtx(store, { [HOST_PREFER]: BURST_THEN_CRAWL, [HOST_FAST]: UNIFORM_FAST });
+    ctx.window.__playinfo__ = payload();
+    await sleep(400);
+    ok('the test ran anyway', ctx.fetchCalls.length === 2, 'fetches: ' + ctx.fetchCalls.length);
+    ok('winner replaced with one this video actually offers', (store.getItem('bcdn:winner:v3') || '').includes(HOST_FAST), store.getItem('bcdn:winner:v3'));
+  }
+
+  console.log('\n== T14: a corrupt or incomplete stored winner is ignored, never shown as NaN ==');
+  {
+    vclock = 0;
+    for (const bad of ['{"host":"x.example.net","ts":' + Date.now() + '}', '{"host":"","kbps":1,"ts":1}', 'not json', '{"host":"x","kbps":5,"ts":' + (Date.now() + 86400000) + '}']) {
+      const store = makeStore();
+      store.setItem('bcdn:winner:v3', bad);
+      const ctx = newCtx(store, { [HOST_PREFER]: BURST_THEN_CRAWL, [HOST_FAST]: UNIFORM_FAST });
+      const boot = ctx.__logs.find(l => l.includes('已加载')) || '';
+      ok('rejected: ' + bad.slice(0, 40), boot.includes('暂无实测结果') && !boot.includes('NaN'), boot);
+    }
   }
 
   console.log(`\n==== ${pass} passed, ${fail} failed ====`);
