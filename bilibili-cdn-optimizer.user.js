@@ -2,7 +2,7 @@
 // @name         B站CDN优选 (海外就近 · 实测择优)
 // @name:en      Bilibili CDN Optimizer (auto speed-test)
 // @namespace    https://github.com/SanJerry007
-// @version      3.2
+// @version      3.3
 // @description  海外看B站不卡:实测每个CDN镜像的持续吞吐,选最快的用,结果跨页面保存并在下次打开视频时立刻生效。不伪造地址、不需VPN。
 // @author       SanJerry007
 // @homepageURL  https://github.com/SanJerry007/bilibili-cdn-optimizer
@@ -61,11 +61,30 @@
     MIN_GAIN: 1.25,
     // 测速硬失败(403/CORS/超时)的镜像,暂时不再选中的时长(ms)
     BAN_TTL: 5 * 60 * 1000,
+    // --- 播放健康看门狗 ---
+    // 选完源就不管了是这个脚本最大的结构缺口: 视频卡成幻灯片它也不知道,就那么钉着等 10 分钟。
+    // 而实测同一个镜像的吞吐能在二十分钟内从 24 Mbps 变到 196 Mbps,变化比 CACHE_TTL 快得多。
+    // 所以要有一条来自真实播放的反馈。
+    HEALTH_WATCH: true,
+    HEALTH_STALL_EVENTS: 3,      // 窗口内攒够这么多次 waiting 就算卡
+    HEALTH_WINDOW_MS: 30000,     // 统计窗口
+    HEALTH_MIN_BUFFER_S: 3,      // 播放中缓冲领先低于这么多秒,连续命中也算卡
+    HEALTH_LOW_SAMPLES: 5,       // 连续这么多秒缓冲都不够才判定,免得被一次抖动误伤
+    // 复测预算刻意比常规小: 这时候播放器本来就在挨饿,不能再抢它带宽。
+    // 而且这里要的不是准确数值,只是"别的源是不是比现在这个强"。
+    HEALTH_PROBE_BYTES: 1024 * 1024,
+    HEALTH_PROBE_MS: 600,
+    HEALTH_MAX_CHECKS: 3,        // 每个视频最多复测这么多次,别来回折腾
+    HEALTH_SEEK_GRACE_MS: 4000,  // 拖进度条前后这段时间内的卡顿一律不算(拖动必然触发 waiting)
     // 角标提示(用熟后可改 false)
     SHOW_TOAST: true,
   };
   // ================================================
 
+  // 脚本在 iframe 里也会各跑一份(@noframes false 是刻意的,内嵌播放器那条路要靠它)。
+  // 改写地址在每个 frame 里都该做,但测速和看门狗只能在顶层做一次:
+  // 真浏览器实测一个视频页跑出了 5 份实例,那就是 5 个看门狗、5 套测速在抢同一条带宽。
+  const IS_TOP = (function () { try { return window.top === window; } catch (e) { return true; } })();
   const STORE_KEY = 'bcdn:winner:v3';
   const LOG_S = 'color:#00a1d6;font-weight:bold';
   function log(...a) { console.log('%c[B站CDN优选]%c', LOG_S, 'color:inherit', ...a); }
@@ -142,7 +161,9 @@
   //      绕开浏览器本地磁盘缓存 —— 播放器可能已经下过这个文件的一段,读本地缓存会量出一个
   //      荒唐的大数。它作用于本地缓存,和 URL 层的缓存穿透不是一回事。)
   //   3. 计时从热身结束才开始,不从 t0 开始。
-  function probe(url) {
+  function probe(url, budget) {
+    const maxBytes = (budget && budget.maxBytes) || CFG.MAX_BYTES;
+    const measureMs = (budget && budget.measureMs) || CFG.MEASURE_MS;
     return new Promise((resolve) => {
       const ctrl = new AbortController();
       let done = false;
@@ -173,7 +194,7 @@
               mBytes += value.length;
             }
           }
-          const enough = mStart && ((now - mStart) >= CFG.MEASURE_MS || total >= CFG.MAX_BYTES);
+          const enough = mStart && ((now - mStart) >= measureMs || total >= maxBytes);
           if (fin || enough) {
             clearTimeout(timer);
             const dt = mStart ? (performance.now() - mStart) : 0;
@@ -227,7 +248,7 @@
   }
 
   async function runSpeedTest(urls) {
-    if (testing) return;
+    if (testing || healthBusy) return;
     // 冷却。没有它的话「全部镜像测速失败」会无限重测: 见 CFG.TEST_COOLDOWN 的注释
     const since = Date.now() - lastTestTs;
     if (lastTestTs && since < CFG.TEST_COOLDOWN) {
@@ -251,7 +272,7 @@
     try {
       const results = [];
       for (const c of cands) {
-        const kbps = await probe(c.url);
+        const kbps = await probe(c.url, null);
         results.push({ host: c.host, kbps });
         // 只有硬失败才拉黑。kbps === 0 是"这次测不出来",没有证据说明镜像有问题
         if (kbps < 0) ban(c.host, '测速硬失败');
@@ -312,6 +333,10 @@
   let liveStreams = [];
   // 这批流对象播放器还会不会再读一次。只有内联 __playinfo__ 是 true,见 applyWinner
   let liveReachable = false;
+  // 测出来更好、但这次播放已经换不掉的主机。角标据此提示"刷新才生效"
+  let pendingBetter = '';
+  // 本次播放的候选地址,看门狗复测时要用
+  let lastVideoUrls = [];
 
   function applyStream(s, cands) {
     const best = pickBest(cands);
@@ -356,9 +381,12 @@
       if (it.isVideo && host) videoHost = host;
     }
     if (videoHost && videoHost !== lastPicked) {
-      log('%c已改写播放地址对象 -> ' + videoHost +
-        ' (播放器若已取走,则从下个视频起生效)', 'color:#28a745;font-weight:bold');
-      lastPicked = videoHost;
+      // 实测过: 播放器一开始就把主机解析定了,之后改 __playinfo__ 它不看。
+      // 21 个流对象全部改写并强制跳转,20 秒内 14 个分片仍然全来自旧主机。
+      // 所以这里只能说"存下了",不能说"改到了",哪怕对象确实被改了。
+      log('%c测速赢家是 ' + videoHost + ',但本次播放已在用 ' + lastPicked +
+        ' 且换不掉了。已存下,下个视频或刷新后生效', 'color:#e0a800;font-weight:bold');
+      pendingBetter = videoHost;
     }
     announce();
   }
@@ -366,11 +394,158 @@
   // 角标只说一件事: 播放器现在拿到的是哪个 host。测速排名单独进控制台,不冒充选源结果。
   function announce() {
     if (!CFG.SHOW_TOAST || !lastPicked) return;
+    if (pendingBetter) {
+      // 这一档必须点得动: 换源只有刷新才生效,光说没用
+      toast('⚠️ 当前源 ' + lastPicked + ' 不佳,已选好 ' + pendingBetter + '\n点这里刷新生效', false, true);
+      return;
+    }
     const measured = cacheValid() && winner.host === lastPicked;
     const label = measured
       ? '🏆 实测最快CDN: ' + lastPicked + ' (' + mbps(winner.kbps) + ')'
       : (preferHit(lastPicked) ? '✅ CDN已优选: ' + lastPicked : '⚠️ 用兜底CDN: ' + lastPicked);
-    toast(label, measured || preferHit(lastPicked));
+    toast(label, measured || preferHit(lastPicked), false);
+  }
+
+  // ---- 播放健康看门狗 ----
+  // 存在的理由: 选完源之后脚本原本对"到底播得顺不顺"一无所知,卡成幻灯片也只会钉着等 10 分钟。
+  // 它做不到的事也要说清楚: 实测过播放器一开始就把主机解析定了,中途改地址无效,
+  // 所以这里最多做到"判断该不该换 + 换好 + 告诉你刷新才生效"。
+  let watching = false, watchedVideo = null;
+  let healthChecks = 0, healthBusy = false, lastHealthTs = 0;
+  let stalls = [], lowSamples = 0;
+  // 只有亲眼见过一次"缓冲健康"之后才开始判定挨饿。没有这一条,视频刚开始填缓冲的那几秒
+  // 缓冲天然就少,看门狗会在那时开测 —— 正是 3.2 刚修掉的"抢首屏带宽",从后门放回来。
+  let armed = false;
+  // 拖进度条会触发 waiting,那不是卡。记下最近一次 seek,附近的事件一律不算
+  let lastSeekTs = 0;
+
+  function resetHealth() {
+    stalls = [];
+    lowSamples = 0;
+    armed = false;
+    healthChecks = 0;
+    lastSeekTs = 0;
+  }
+
+  function watchPlayback() {
+    if (!CFG.HEALTH_WATCH || watching) return;
+    watching = true;
+    const tick = () => {
+      try {
+        const v = document.querySelector('video');
+        if (v && v !== watchedVideo) {
+          watchedVideo = v;
+          if (!v.__bcdnWatched) {
+            v.__bcdnWatched = true;   // 同一个元素别挂两遍
+            const onStall = () => {
+              if (Date.now() - lastSeekTs < CFG.HEALTH_SEEK_GRACE_MS) return;
+              stalls.push(Date.now());
+              evaluateHealth();
+            };
+            const onSeek = () => { lastSeekTs = Date.now(); stalls = []; lowSamples = 0; };
+            try {
+              v.addEventListener('waiting', onStall);
+              v.addEventListener('stalled', onStall);
+              v.addEventListener('seeking', onSeek);
+            } catch (e) {}
+          }
+          log('开始监看播放健康度');
+        }
+        sampleBuffer();
+      } catch (e) { /* 页面还没就绪,下一轮再说 */ }
+      setTimeout(tick, 1000);
+    };
+    tick();
+  }
+
+  function sampleBuffer() {
+    const v = watchedVideo;
+    try {
+      if (!v || v.paused || v.ended) { lowSamples = 0; return; }
+      const b = v.buffered;
+      if (!b || !b.length) { lowSamples = 0; return; }
+      const ct = v.currentTime;
+      // 必须取"包含播放位置的那一段",不能一律取最后一段。往回拖进度条之后,最后一段在很靠后的
+      // 地方,拿它算出来的领先量是个大数,真正的挨饿反而看不见。
+      let end = null;
+      for (let i = 0; i < b.length; i++) {
+        if (b.start(i) <= ct + 0.25 && b.end(i) >= ct) { end = b.end(i); break; }
+      }
+      if (end === null) { lowSamples = 0; return; }   // 播放位置根本不在任何已缓冲区间里
+      // 视频快播完时缓冲领先本来就接近 0,后面根本没东西可缓冲,那不是挨饿。
+      // 真浏览器实测栽过: 视频播到 584.8 秒、缓冲到 585 秒(就是全片结尾),
+      // 看门狗照样判成"缓冲连续 5 秒不足"并跑了一轮复测。
+      const dur = v.duration;
+      if (isFinite(dur) && dur > 0 && end >= dur - 0.5) { lowSamples = 0; return; }
+      const ahead = end - ct;
+      if (ahead >= CFG.HEALTH_MIN_BUFFER_S) { armed = true; lowSamples = 0; return; }
+      // 还没见过一次健康缓冲,说明播放器还在填首屏,这时候测速就是跟它抢带宽
+      if (!armed) { lowSamples = 0; return; }
+      if (Date.now() - lastSeekTs < CFG.HEALTH_SEEK_GRACE_MS) { lowSamples = 0; return; }
+      lowSamples++;
+      if (lowSamples >= CFG.HEALTH_LOW_SAMPLES) evaluateHealth();
+    } catch (e) { lowSamples = 0; }
+  }
+
+  function evaluateHealth() {
+    const now = Date.now();
+    stalls = stalls.filter(t => now - t < CFG.HEALTH_WINDOW_MS);
+    const starving = lowSamples >= CFG.HEALTH_LOW_SAMPLES;
+    const stalled = stalls.length >= CFG.HEALTH_STALL_EVENTS;
+    if (!starving && !stalled) return;
+    if (healthBusy || testing) return;
+    if (healthChecks >= CFG.HEALTH_MAX_CHECKS) return;
+    // 用自己的冷却,不看 lastTestTs: 共用的话一次复测会把本页那次常规全量测速整个吃掉
+    if (lastHealthTs && now - lastHealthTs < CFG.TEST_COOLDOWN) return;
+    const why = starving ? ('缓冲连续 ' + lowSamples + ' 秒不足') : (stalls.length + ' 次卡顿');
+    healthChecks++;
+    stalls = [];
+    lowSamples = 0;
+    healthRetest(why);
+  }
+
+  async function healthRetest(why) {
+    healthBusy = true;
+    lastHealthTs = Date.now();
+    try {
+      // 跟 runSpeedTest 一样要滤掉黑名单、也要守 MAX_MIRRORS。
+      // 不滤黑名单的话,刚因为撑不住被拉黑的主机会在下一轮复测里重新当选。
+      let cands = uniqueByHost(lastVideoUrls).filter(c => !isBanned(c.host));
+      if (cands.length > CFG.MAX_MIRRORS) cands = cands.slice(0, CFG.MAX_MIRRORS);
+      if (cands.length <= 1) {
+        log('播放不顺(' + why + '),但只有 ' + cands.length + ' 个可用镜像,换无可换');
+        if (CFG.SHOW_TOAST) toast('⚠️ 播放不顺,但没有别的镜像可换', false, false);
+        return;
+      }
+      log('%c播放不顺(' + why + '),小预算复测 ' + cands.length + ' 个镜像', 'color:#e0a800;font-weight:bold');
+      const budget = { maxBytes: CFG.HEALTH_PROBE_BYTES, measureMs: CFG.HEALTH_PROBE_MS };
+      const res = [];
+      for (const c of cands) res.push({ host: c.host, kbps: await probe(c.url, budget) });
+      res.sort((a, b) => b.kbps - a.kbps);
+      log('复测结果: ' + res.map(r => r.host + ' ' + (r.kbps > 0 ? mbps(r.kbps) : 'FAIL')).join(' | '));
+      const valid = res.filter(r => r.kbps > 0);
+      if (!valid.length) {
+        log('复测全部失败,不动它');
+        if (CFG.SHOW_TOAST) toast('⚠️ 播放不顺,但复测全部失败\n无法判断该不该换源', false, false);
+        return;
+      }
+      const cur = valid.find(r => r.host === lastPicked);
+      const top = valid[0];
+      if (top.host === lastPicked || (cur && top.kbps < cur.kbps * CFG.MIN_GAIN)) {
+        // 这一支跟"换源"同样重要: 别的源也不更快,说明卡的原因根本不在选源。
+        // 不说清楚的话,用户会一直以为是 CDN 没选对,白折腾。
+        log('%c其它镜像并不更快,卡的原因不在选源,是这条线路此刻的状况', 'color:#d9534f');
+        if (CFG.SHOW_TOAST) toast('⚠️ 播放不顺,但实测各源一样慢\n不是选错源,是当前线路状况', false, false);
+        return;
+      }
+      ban(lastPicked, '播放中实测撑不住');
+      saveWinner({ host: top.host, kbps: top.kbps, ts: Date.now() });
+      pendingBetter = top.host;
+      log('%c改选 ' + top.host + ' (' + mbps(top.kbps) + '),刷新后生效', 'color:#28a745;font-weight:bold');
+      announce();
+    } finally {
+      healthBusy = false;
+    }
   }
 
   function processData(json, reachable) {
@@ -381,6 +556,10 @@
       liveStreams = [];
       liveReachable = !!reachable;
       lastPicked = '';
+      pendingBetter = '';
+      // SPA 里换视频不重新加载页面。不清零的话,HEALTH_MAX_CHECKS 用完之后
+      // 看门狗对之后所有视频都永久失效,而且是悄无声息地失效。
+      resetHealth();
       const videoUrls = [];
       if (d.dash) {
         (d.dash.video || []).forEach(s => optimizeStream(s, videoUrls, true));
@@ -409,8 +588,10 @@
       }
       // 缓存里的赢家不在这个视频给出的镜像里,等于没有结论,照样要测。
       // 只看 cacheValid() 的话,一个存着别处赢家的缓存会把测速压制整整 10 分钟。
+      lastVideoUrls = videoUrls.slice();
+      if (CFG.HEALTH_WATCH && IS_TOP) watchPlayback();
       const winnerUsable = cacheValid() && videoUrls.some(u => hostOf(u) === winner.host);
-      if (CFG.MODE === 'auto' && !winnerUsable && videoUrls.length > 1) {
+      if (CFG.MODE === 'auto' && IS_TOP && !winnerUsable && videoUrls.length > 1) {
         // 注意是 whenPlayerSettled 而不是直接跑,理由见 CFG.TEST_DELAY_MS 那段
         whenPlayerSettled(() => runSpeedTest(videoUrls));
       }
@@ -532,9 +713,9 @@
 
   // ---- 角标提示 ----
   let toastEl = null, toastTimer = null;
-  function toast(text, ok) {
+  function toast(text, ok, clickToReload) {
     try {
-      if (!document.body) { document.addEventListener('DOMContentLoaded', () => toast(text, ok)); return; }
+      if (!document.body) { document.addEventListener('DOMContentLoaded', () => toast(text, ok, clickToReload)); return; }
       if (!toastEl) {
         toastEl = document.createElement('div');
         toastEl.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:999999;' +
@@ -544,13 +725,19 @@
         document.body.appendChild(toastEl);
       }
       toastEl.textContent = text;
+      toastEl.style.whiteSpace = 'pre-line';
       toastEl.style.background = ok ? 'rgba(40,167,69,.95)' : 'rgba(0,161,214,.95)';
       toastEl.style.opacity = '1';
+      // 要刷新才生效的那一档必须点得动,否则等于只是抱怨一句
+      toastEl.style.pointerEvents = clickToReload ? 'auto' : 'none';
+      toastEl.style.cursor = clickToReload ? 'pointer' : 'default';
+      toastEl.onclick = clickToReload ? function () { location.reload(); } : null;
       clearTimeout(toastTimer);
-      toastTimer = setTimeout(() => { if (toastEl) toastEl.style.opacity = '0'; }, 4500);
+      // 可点的那条不自动消失,不然用户还没看见就没了
+      if (!clickToReload) toastTimer = setTimeout(() => { if (toastEl) toastEl.style.opacity = '0'; }, 4500);
     } catch (e) {}
   }
 
-  log('已加载 v3.2 · 模式: ' + CFG.MODE + ' · 兜底优先: ' + CFG.PREFER.join(', ') +
+  log('已加载 v3.3 · 模式: ' + CFG.MODE + ' · 兜底优先: ' + CFG.PREFER.join(', ') +
     (cacheValid() ? ' · 沿用上次实测赢家: ' + winner.host + ' (' + mbps(winner.kbps) + ')' : ' · 暂无实测结果'));
 })();

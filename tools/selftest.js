@@ -49,7 +49,7 @@ function makeBody(profile) {
   };
 }
 
-function newCtx(store, profiles) {
+function newCtx(store, profiles, opt) {
   const logs = [];
   const ctx = {
     console: { log: (...a) => logs.push(a.map(String).join(' ')), warn: () => {}, error: () => {} },
@@ -60,11 +60,12 @@ function newCtx(store, profiles) {
     document: {
       body: { appendChild() {} },
       addEventListener() {},
-      // the script waits for the player to have buffered before probing; __bufferAhead drives that
+      // the script waits for the player to have buffered before probing, and the watchdog listens
+      // on this same element; __bufferAhead and __videoPaused drive both
       querySelector: (sel) => {
         if (sel !== 'video') return null;
         if (ctx.__bufferAhead == null) return null;
-        return { currentTime: 0, buffered: { length: 1, end: () => ctx.__bufferAhead } };
+        return ctx.__video;
       },
       createElement: () => {
         const el = { style: { cssText: '' } };
@@ -73,14 +74,41 @@ function newCtx(store, profiles) {
           get() { return ctx.__lastToast || ''; },
           set(v) { ctx.__lastToast = v; },
         });
+        // the "refresh to apply" badge has to be clickable; a test must be able to see that
+        Object.defineProperty(el, 'onclick', {
+          get() { return ctx.__toastClick || null; },
+          set(v) { ctx.__toastClick = v; ctx.__lastToastClickable = !!v; },
+        });
         return el;
       },
     },
     __lastToast: '',
+    __lastToastClickable: false,
     __bufferAhead: 30,
+    __videoPaused: false,
+    __duration: Infinity,
     fetchCalls: [],
     __logs: logs,
   };
+  // a controllable <video>: tests drive __bufferAhead / __videoPaused and fire stall events
+  const listeners = {};
+  ctx.__video = {
+    currentTime: 0,
+    ended: false,
+    get duration() { return ctx.__duration; },
+    get paused() { return ctx.__videoPaused; },
+    // a real TimeRanges has start() too, and the script now looks for the range CONTAINING
+    // currentTime rather than blindly taking the last one, so the stub has to model both
+    get buffered() {
+      return { length: 1, start: () => ctx.__bufferStart || 0, end: () => ctx.__bufferAhead };
+    },
+    addEventListener: (ev, fn) => { (listeners[ev] = listeners[ev] || []).push(fn); },
+  };
+  ctx.__fire = (ev, times) => {
+    for (let i = 0; i < (times || 1); i++) for (const fn of (listeners[ev] || [])) fn();
+  };
+  ctx.__listenerCount = (ev) => (listeners[ev] || []).length;
+
   ctx.fetch = function (url) {
     ctx.fetchCalls.push(url);
     const host = new URL(url).host;
@@ -98,6 +126,8 @@ function newCtx(store, profiles) {
   vm.createContext(ctx);
   ctx.window = ctx;
   ctx.globalThis = ctx;
+  // window.top !== window marks a sub-frame; the script must not probe from one
+  ctx.top = (opt && opt.asFrame) ? { isTop: true } : ctx;
   vm.runInContext(code, ctx, { filename: 'userscript.js' });
   return ctx;
 }
@@ -250,12 +280,16 @@ const SETTLE = 2800;
     p.data.dash.audio = [{ baseUrl: `https://${HOST_PREFER}/a.m4s?x=1`, backupUrl: [] }];
     ctx.window.__playinfo__ = p;
     await sleep(SETTLE);
-    const line = ctx.__logs.find(l => l.includes('已改写播放地址对象'));
-    ok('rewrite was announced', !!line, ctx.__logs.join(' | ').slice(0, 300));
-    ok('announcement names the video host', !!line && line.includes(HOST_FAST), line);
-    ok('video really moved', p.data.dash.video[0].baseUrl.includes(HOST_FAST), p.data.dash.video[0].baseUrl);
-    const badge = ctx.__logs.concat([ctx.__lastToast || '']).join(' | ');
-    ok('badge reports the measured winner, not the audio host', (ctx.__lastToast || '').includes(HOST_FAST), ctx.__lastToast);
+    // the player resolves its host once and ignores later mutation of __playinfo__ (measured:
+    // 21 stream objects rewritten plus a forced seek, 20s, every segment still from the old host).
+    // So the script must say "saved for next time", never imply the running stream moved.
+    const line = ctx.__logs.find(l => l.includes('换不掉了'));
+    ok('says the winner is saved for later', !!line, ctx.__logs.join(' | ').slice(0, 300));
+    ok('and names the VIDEO host, not the audio one', !!line && line.includes(HOST_FAST), line);
+    ok('never claims it rewrote the running stream', !ctx.__logs.some(l => l.includes('已改写播放地址对象')), '');
+    ok('badge names the better host', (ctx.__lastToast || '').includes(HOST_FAST), ctx.__lastToast);
+    ok('badge tells the user a refresh is needed', (ctx.__lastToast || '').includes('刷新'), ctx.__lastToast);
+    ok('badge is actually clickable', ctx.__lastToastClickable === true, String(ctx.__lastToastClickable));
   }
 
   console.log('\n== T9: on the fetch/XHR paths the payload is already serialized, so do NOT claim a rewrite ==');
@@ -364,6 +398,123 @@ const SETTLE = 2800;
     ok('and it says so', ctx.__logs.some(l => l.includes('已缓冲') && l.includes('现在测速')), ctx.__logs.slice(-4).join(' | '));
     // the TEST_DEFER_MAX_MS escape hatch (45s) is deliberately not exercised here: a CI gate that
     // sleeps 45 seconds gets deleted. It is covered by reading, not by this harness.
+  }
+
+  console.log('\n== T16: the watchdog retests when playback actually stalls ==');
+  {
+    vclock = 0;
+    const store = makeStore();
+    // a fresh winner, so the normal test is suppressed and only the watchdog can fire a probe
+    store.setItem('bcdn:winner:v3', JSON.stringify({ host: HOST_PREFER, kbps: 5000, ts: Date.now() }));
+    const ctx = newCtx(store, { [HOST_PREFER]: BURST_THEN_CRAWL, [HOST_FAST]: UNIFORM_FAST });
+    ctx.window.__playinfo__ = payload();
+    await sleep(1500);
+    ok('watchdog attached to the video', ctx.__listenerCount('waiting') > 0, 'listeners: ' + ctx.__listenerCount('waiting'));
+    ok('no probe while playback is healthy', ctx.fetchCalls.length === 0, 'fetches: ' + ctx.fetchCalls.length);
+    ctx.__fire('waiting', 3);
+    await sleep(1200);
+    ok('stalling triggers a retest', ctx.fetchCalls.length >= 2, 'fetches: ' + ctx.fetchCalls.length);
+    const line = ctx.__logs.find(l => l.includes('播放不顺'));
+    ok('and says why', !!line && line.includes('次卡顿'), line);
+    ok('switched to the faster mirror', (store.getItem('bcdn:winner:v3') || '').includes(HOST_FAST), store.getItem('bcdn:winner:v3'));
+    ok('badge offers the refresh', (ctx.__lastToast || '').includes('刷新') && ctx.__lastToastClickable, ctx.__lastToast);
+  }
+
+  console.log('\n== T17: when every mirror is equally slow, say so instead of blaming the mirror ==');
+  {
+    vclock = 0;
+    const store = makeStore();
+    store.setItem('bcdn:winner:v3', JSON.stringify({ host: HOST_PREFER, kbps: 5000, ts: Date.now() }));
+    // both mirrors crawl: nothing to switch to
+    const ctx = newCtx(store, { [HOST_PREFER]: BURST_THEN_CRAWL, [HOST_FAST]: BURST_THEN_CRAWL });
+    ctx.window.__playinfo__ = payload();
+    await sleep(1500);
+    ctx.__fire('waiting', 3);
+    await sleep(1500);
+    ok('it did retest', ctx.fetchCalls.length >= 2, 'fetches: ' + ctx.fetchCalls.length);
+    ok('no mirror was banned', !ctx.__logs.some(l => l.includes('暂时屏蔽')), ctx.__logs.filter(l => l.includes('屏蔽')).join(' | '));
+    ok('tells the user it is the line, not the pick', ctx.__logs.some(l => l.includes('不在选源')), ctx.__logs.slice(-3).join(' | '));
+    ok('badge says the same', (ctx.__lastToast || '').includes('一样慢'), ctx.__lastToast);
+    ok('and that badge is NOT a refresh prompt', !(ctx.__lastToast || '').includes('点这里刷新'), ctx.__lastToast);
+  }
+
+  console.log('\n== T18: a paused video is not "starving", and the watchdog is rate limited ==');
+  {
+    vclock = 0;
+    const store = makeStore();
+    store.setItem('bcdn:winner:v3', JSON.stringify({ host: HOST_PREFER, kbps: 5000, ts: Date.now() }));
+    const ctx = newCtx(store, { [HOST_PREFER]: BURST_THEN_CRAWL, [HOST_FAST]: UNIFORM_FAST });
+    ctx.__bufferAhead = 0;       // no buffer at all
+    ctx.__videoPaused = true;    // but the user paused it, which is not a stall
+    ctx.window.__playinfo__ = payload();
+    await sleep(SETTLE + 3000);
+    ok('paused with an empty buffer does not trigger anything', ctx.fetchCalls.length === 0, 'fetches: ' + ctx.fetchCalls.length);
+    // playing, but the buffer has NEVER been healthy: this is the initial fill, not a stall.
+    // Probing here would re-create the bandwidth theft 3.2 was written to remove.
+    ctx.__videoPaused = false;
+    await sleep(8000);
+    ok('an empty buffer that was never healthy is treated as startup, not a stall', ctx.fetchCalls.length === 0, 'fetches: ' + ctx.fetchCalls.length);
+    // now let it become healthy once, which arms the detector, then starve it for real
+    ctx.__bufferAhead = 30;
+    await sleep(1500);
+    ctx.__bufferAhead = 0;
+    await sleep(7000);
+    ok('starving after a healthy buffer does trigger a retest', ctx.fetchCalls.length >= 2, 'fetches: ' + ctx.fetchCalls.length);
+    ok('and says it was the buffer', ctx.__logs.some(l => l.includes('缓冲连续')), ctx.__logs.filter(l => l.includes('播放不顺')).join(' | '));
+    const n = ctx.fetchCalls.length;
+    ctx.__fire('waiting', 5);
+    await sleep(1500);
+    ok('a second stall inside the cooldown does not re-probe', ctx.fetchCalls.length === n, `${n} -> ${ctx.fetchCalls.length}`);
+  }
+
+  console.log('\n== T19: playing out the end of a video is not starving ==');
+  {
+    vclock = 0;
+    const store = makeStore();
+    store.setItem('bcdn:winner:v3', JSON.stringify({ host: HOST_PREFER, kbps: 5000, ts: Date.now() }));
+    const ctx = newCtx(store, { [HOST_PREFER]: BURST_THEN_CRAWL, [HOST_FAST]: UNIFORM_FAST });
+    // everything to the end of the file is buffered, so buffered-ahead is legitimately tiny
+    ctx.__duration = 600;
+    ctx.__bufferAhead = 600;      // buffered end == duration
+    ctx.__video.currentTime = 599.8;
+    ctx.window.__playinfo__ = payload();
+    await sleep(8000);
+    ok('no retest fired at the end of the file', ctx.fetchCalls.length === 0, 'fetches: ' + ctx.fetchCalls.length);
+    ok('and it did not claim playback was stalling', !ctx.__logs.some(l => l.includes('播放不顺')), ctx.__logs.filter(l => l.includes('播放不顺')).join(' | '));
+  }
+
+  console.log('\n== T20: only the top frame probes; iframes must not each run their own ==');
+  {
+    vclock = 0;
+    const store = makeStore();
+    const ctx = newCtx(store, { [HOST_PREFER]: BURST_THEN_CRAWL, [HOST_FAST]: UNIFORM_FAST }, { asFrame: true });
+    const p = payload();
+    ctx.window.__playinfo__ = p;
+    await sleep(SETTLE + 1000);
+    ok('a sub-frame runs no speed test', ctx.fetchCalls.length === 0, 'fetches: ' + ctx.fetchCalls.length);
+    ok('a sub-frame starts no watchdog', !ctx.__logs.some(l => l.includes('开始监看')), ctx.__logs.join(' | ').slice(0, 200));
+    ok('but it STILL rewrites the URL it was given', p.data.dash.video[0].baseUrl.includes(HOST_PREFER), p.data.dash.video[0].baseUrl);
+  }
+
+  console.log('\n== T21: scrubbing the timeline is not a stalled mirror ==');
+  {
+    vclock = 0;
+    const store = makeStore();
+    store.setItem('bcdn:winner:v3', JSON.stringify({ host: HOST_PREFER, kbps: 5000, ts: Date.now() }));
+    const ctx = newCtx(store, { [HOST_PREFER]: BURST_THEN_CRAWL, [HOST_FAST]: UNIFORM_FAST });
+    ctx.window.__playinfo__ = payload();
+    await sleep(1500);
+    // every seek fires 'waiting'; three drags in a row must not be read as a bad mirror
+    ctx.__fire('seeking', 1);
+    ctx.__fire('waiting', 3);
+    await sleep(1200);
+    ok('seeking does not trigger a retest', ctx.fetchCalls.length === 0, 'fetches: ' + ctx.fetchCalls.length);
+    ok('and no badge blamed the mirror', !(ctx.__lastToast || '').includes('播放不顺'), ctx.__lastToast);
+    // once the grace window has passed, a genuine stall still counts
+    await sleep(4200);
+    ctx.__fire('waiting', 3);
+    await sleep(1200);
+    ok('a real stall after the grace window still counts', ctx.fetchCalls.length >= 2, 'fetches: ' + ctx.fetchCalls.length);
   }
 
   console.log(`\n==== ${pass} passed, ${fail} failed ====`);
