@@ -61,6 +61,18 @@ node tools/selftest.js
 
 它把真实的脚本文件加载进一个桩浏览器（假的 fetch / XHR / localStorage / 时钟），断言的是行为不是结构。80 条断言里，53 条在 2.1 上是红的、23 条在 3.2 上是红的、3 条在 3.3 上是红的，所以这个闸门不会对着坏版本打绿灯。CI 每次 push 都跑。
 
+### 克隆这个仓库
+
+```bash
+git clone --recursive https://github.com/SanJerry007/bilibili-cdn-optimizer.git
+```
+
+`guards/` 和 `style/` 是两个 submodule，装着这个仓库的检查工具（PII 扫描、数据边界、破折号闸门）。**不带 `--recursive` 克隆的话，这两个目录会存在但是空的**，这时提交会被明确挡下并告诉你跑 `git submodule update --init --recursive`。这是刻意的：空的 `guards/` 是一个没有防护的仓库，不是一个没什么可查的仓库，所以它必须大声失败，而不是静默放行。
+
+这一层间接不是多余的。实测对照：把 `core.hooksPath` 直接指向空的 `guards/hooks`，一个带着私人邮箱的提交**顺利落地、退出 0、没有任何输出**；换成指向仓内的 `.githooks/` 转发脚本，同一个提交被拦住，零个提交。
+
+工具只在这里用，不参与脚本本身的运行，所以只想用脚本的话不需要它们。
+
 ### 进阶配置
 
 编辑脚本顶部的 `CFG`：

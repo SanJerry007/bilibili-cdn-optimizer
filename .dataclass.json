@@ -1,0 +1,26 @@
+{
+  "_comment": [
+    "Every path in this repo belongs to exactly one class. Enforced by guards/tools/data_boundary.py,",
+    "which runs from .githooks and in CI.",
+    "TOOL    = code, docs, tests. Public.",
+    "FIXTURE = LIFELIKE test data, whose real counterpart sits in the operator's life and is",
+    "          structurally indistinguishable from it. Must come from a generator, because a real",
+    "          record cannot be regenerated, so pasting one in fails at commit.",
+    "DATA    = anything a REAL RUN produced. Never in a PUBLIC repo."
+  ],
+
+  "_audited": "2026-09-14, first audit, done when this repo migrated to the fleet-guards submodule. The question data_boundary actually asks is not 'is there real output sitting in the tree' but 'CAN shipped code or documentation put real output at a repo-relative path'. Here the answer is stronger than an inventory: THERE IS NO FILESYSTEM WRITE ANYWHERE IN THE SHIPPED CODE. Grepped the two shipped files for writeFile / appendFile / createWriteStream / fs. / open-for-write: bilibili-cdn-optimizer.user.js has exactly one persistence call, localStorage.setItem(STORE_KEY, ...) at line 121, which writes the measured winner host into the BROWSER's storage on a bilibili origin and can reach no path at all; tools/selftest.js has one fs call and it is readFileSync of the userscript under test, and its localStorage stub is an in-memory Map. The userscript runs with @grant none, so it has no GM_* storage either. That is why `data` is empty, and it is a conclusion rather than a default: there is no code path that could fill it.",
+
+  "_no_companion": "This repo has NO private companion, deliberately and not by omission. The only state the tool keeps is one JSON object in the viewer's own browser localStorage (host, kbps, ts), which never leaves that browser, never reaches the operator's disk, and is not the operator's data in the first place -- it is a CDN hostname and a throughput number measured by whoever is watching. There is nothing for a companion repo to hold. If a future version ever records a run to disk, that is the change that has to create one, and this key is where to say so.",
+
+  "_fixture_note": "`fixture` is empty and that is also audited. tools/selftest.js builds its payloads INLINE in code (see payload() and the HOST_FAST / HOST_PREFER constants) rather than loading any file, so there is no fixture file to classify or regenerate. The synthetic host is upos-fast.example.net, inside the synthetic namespace. The other constant, upos-hz-mirrorakam.akamaized.net, is a REAL hostname and is kept on purpose: CFG.PREFER matches the substring 'akamaized.net', so a test that used a made-up domain would not exercise the fallback path at all. It is bilibili's public CDN infrastructure, served to every viewer worldwide, and identifies no person. pii_guard scans it clean without an allowlist entry.",
+
+  "_measurements_note": "README.md quotes throughput figures measured on the maintainer's own connection (for example 5.8 Mbps during buffer fill versus 195 to 281 Mbps idle). Those are kept because they are the EVIDENCE for design decisions that would otherwise read as taste, and they are aggregate numbers that identify no person and no location. The one sentence that did leak a real circumstance, naming the maintainer's region alongside 'direct connection', was caught by the semantic gate at push time on 2026-09-13 and rewritten before it ever reached the remote; the commit that would have carried it was amended, not followed by a second commit.",
+
+  "tool": [],
+  "_tool_note": "Empty because check 4 found no tracked file wearing the shape of real-run output, across the 8 tracked files that are not submodule pointers. TOOL is the default class and needs no entry; this list exists only for a hand-written file shaped like a ledger, and there is none.",
+
+  "data": [],
+  "data_sealed": [],
+  "fixture": []
+}

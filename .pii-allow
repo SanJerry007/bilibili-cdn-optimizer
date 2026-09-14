@@ -1,0 +1,19 @@
+# .pii-allow -- real-world identifiers this repo is ALLOWED to contain.
+#
+# One literal per line, each with a reason. This is an allowlist with a written justification: it
+# shows up in the diff and has to be argued for. That is the opposite of quietly widening a regex.
+#
+# Legitimate entries look like: a vendor's public sender address that a parser must recognize, or a
+# public support line. NEVER put the operator's own data here -- if it is theirs, it does not belong
+# in a public repo at all.
+#
+# Example:
+#   noreply@vendor.example    # the sender address the classifier fixture must match
+#
+# THIS FILE IS INTENTIONALLY EMPTY, and that is an audited result rather than a file nobody filled
+# in. pii_guard runs clean over the working tree AND the full history of this repo with no entries
+# at all (2026-09-14: 8 files, 11 commits, 29 blobs, zero findings). The real hostnames this repo
+# does contain -- upos-hz-mirrorakam.akamaized.net and upos-sz-mirrorcosov.bilivideo.com -- are
+# bilibili's public CDN infrastructure, served to every viewer worldwide, and no rule flags them
+# because they identify no person. If something ever does need an exemption, it goes here with a
+# sentence saying why, and the emptiness of this file stops being the answer.

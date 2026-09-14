@@ -1,7 +1,12 @@
 # dash-guard in CI: the house rule that published prose carries no en/em dash (the ASCII hyphen is
-# code syntax and is left alone). Runtime output is normalized in the skill's _inline renderer; this
-# gate keeps the docs and source comments clean. Style, not security, so it scans the current tree
-# only (a dash in old history is harmless and needs no rewrite).
+# code syntax and is left alone). Style, not security, so it scans the current tree only.
+#
+# The steps live in style/ci/dash-guard/action.yml, one copy for the whole fleet. This repo used to
+# carry its own 218-line copy of the scanner, 270 lines behind the source. That copy told the truth
+# in CI and lied locally: run from a parent directory that is not a git repo, its `git ls-files`
+# listed nothing and it printed "clean" with exit 0, so "nothing to check" and "checked, nothing
+# wrong" were the same output. The version in the submodule fails closed on exactly that, and says
+# how many files it examined and how many it skipped.
 name: dash-guard
 
 on:
@@ -13,8 +18,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
-      - name: No en/em dash in published prose
-        run: python tools/dash_guard.py --tree
+      - uses: ./style/ci/dash-guard

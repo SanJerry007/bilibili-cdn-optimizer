@@ -1,0 +1,29 @@
+# pii_guard in CI, the authority.
+#
+# A local hook is a fast fail, not a guarantee: it can be skipped with --no-verify, it is not
+# installed on a fresh clone until someone opts in, and it does not exist at all for an outside
+# contributor. This runs on GitHub on every push and every PR and cannot be reached by any of that.
+#
+# The steps live in guards/ci/pii-guard/action.yml so there is one copy across the fleet rather
+# than one per repo. This file is only the wiring; the action carries the reasoning for each step.
+#
+# It runs WITHOUT the operator's private denylist, which never leaves their machine. That is the
+# point of the allowlist design: the structural checks need no private data, so they work here.
+name: pii-guard
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0        # the history scan is the point; a shallow clone would see nothing
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - uses: ./guards/ci/pii-guard
