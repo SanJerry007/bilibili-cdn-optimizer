@@ -2,7 +2,7 @@
 // @name         B站CDN优选 (海外就近 · 实测择优)
 // @name:en      Bilibili CDN Optimizer (auto speed-test)
 // @namespace    https://github.com/SanJerry007
-// @version      3.3
+// @version      3.3.1
 // @description  海外看B站不卡:实测每个CDN镜像的持续吞吐,选最快的用,结果跨页面保存并在下次打开视频时立刻生效。不伪造地址、不需VPN。
 // @author       SanJerry007
 // @homepageURL  https://github.com/SanJerry007/bilibili-cdn-optimizer
@@ -76,6 +76,10 @@
     HEALTH_PROBE_MS: 600,
     HEALTH_MAX_CHECKS: 3,        // 每个视频最多复测这么多次,别来回折腾
     HEALTH_SEEK_GRACE_MS: 4000,  // 拖进度条前后这段时间内的卡顿一律不算(拖动必然触发 waiting)
+    // 开头这段时间内,只要还没见过一次健康缓冲,就一概不判卡: 那是播放器在填首屏。
+    // 但这个保护是有期限的 —— 写成"没健康过就永不触发"的话,一个从第一秒就坏的播放
+    // 永远也武装不了,看门狗对最该管的那种情况反而完全失灵。
+    HEALTH_FIRST_FILL_MS: 20000,
     // 角标提示(用熟后可改 false)
     SHOW_TOAST: true,
   };
@@ -418,13 +422,24 @@
   let armed = false;
   // 拖进度条会触发 waiting,那不是卡。记下最近一次 seek,附近的事件一律不算
   let lastSeekTs = 0;
+  let watchStartTs = 0;
 
+  // 首屏保护窗口。两条判定路径(缓冲采样 和 waiting 事件)都必须过这一关。
+  // 之前只在缓冲那条路上查 armed,事件那条路没查,于是首屏填缓冲时三次 waiting 照样
+  // 能触发复测 —— 等于这道闸只修了一半,而另一半正是最容易触发的那半。
+  function inStartupWindow() {
+    return !armed && (Date.now() - watchStartTs) < CFG.HEALTH_FIRST_FILL_MS;
+  }
+
+  // 健康证据只属于某一次播放。换了 video 元素或换了视频,之前"见过健康缓冲"就不再作数,
+  // 否则一个健康的贴片广告播放器会替正片的首屏把看门狗提前武装好。
   function resetHealth() {
     stalls = [];
     lowSamples = 0;
     armed = false;
     healthChecks = 0;
     lastSeekTs = 0;
+    watchStartTs = Date.now();
   }
 
   function watchPlayback() {
@@ -435,9 +450,15 @@
         const v = document.querySelector('video');
         if (v && v !== watchedVideo) {
           watchedVideo = v;
+          // 换元素等于换了一次播放,健康证据清零重来
+          armed = false;
+          stalls = [];
+          lowSamples = 0;
+          watchStartTs = Date.now();
           if (!v.__bcdnWatched) {
             v.__bcdnWatched = true;   // 同一个元素别挂两遍
             const onStall = () => {
+              if (inStartupWindow()) return;
               if (Date.now() - lastSeekTs < CFG.HEALTH_SEEK_GRACE_MS) return;
               stalls.push(Date.now());
               evaluateHealth();
@@ -479,8 +500,8 @@
       if (isFinite(dur) && dur > 0 && end >= dur - 0.5) { lowSamples = 0; return; }
       const ahead = end - ct;
       if (ahead >= CFG.HEALTH_MIN_BUFFER_S) { armed = true; lowSamples = 0; return; }
-      // 还没见过一次健康缓冲,说明播放器还在填首屏,这时候测速就是跟它抢带宽
-      if (!armed) { lowSamples = 0; return; }
+      // 还没见过一次健康缓冲,而且还在首屏保护窗口里: 播放器正在填缓冲,这时候测速就是跟它抢带宽
+      if (inStartupWindow()) { lowSamples = 0; return; }
       if (Date.now() - lastSeekTs < CFG.HEALTH_SEEK_GRACE_MS) { lowSamples = 0; return; }
       lowSamples++;
       if (lowSamples >= CFG.HEALTH_LOW_SAMPLES) evaluateHealth();
@@ -738,6 +759,6 @@
     } catch (e) {}
   }
 
-  log('已加载 v3.3 · 模式: ' + CFG.MODE + ' · 兜底优先: ' + CFG.PREFER.join(', ') +
+  log('已加载 v3.3.1 · 模式: ' + CFG.MODE + ' · 兜底优先: ' + CFG.PREFER.join(', ') +
     (cacheValid() ? ' · 沿用上次实测赢家: ' + winner.host + ' (' + mbps(winner.kbps) + ')' : ' · 暂无实测结果'));
 })();

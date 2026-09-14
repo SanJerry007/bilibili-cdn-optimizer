@@ -56,7 +56,12 @@ function newCtx(store, profiles, opt) {
     location: { href: 'https://www.bilibili.com/video/BV1xx411c7mD/' },
     localStorage: store,
     performance: { now: () => vclock },
-    setTimeout, clearTimeout, Promise, URL, Headers, Response, AbortController, Uint8Array, Date, Math, JSON, Set, Map, Array, Object, String, Number,
+    setTimeout, clearTimeout, Promise, URL, Headers, Response, AbortController, Uint8Array, Math, JSON, Set, Map, Array, Object, String, Number,
+    // a Date whose now() can be shifted, so a test can step past a 20s window without sleeping 20s
+    Date: Object.assign(function BCDNDate(...a) { return a.length ? new Date(...a) : new Date(Date.now() + (ctx.__clockSkew || 0)); }, {
+      now: () => Date.now() + (ctx.__clockSkew || 0),
+    }),
+    __clockSkew: 0,
     document: {
       body: { appendChild() {} },
       addEventListener() {},
@@ -515,6 +520,42 @@ const SETTLE = 2800;
     ctx.__fire('waiting', 3);
     await sleep(1200);
     ok('a real stall after the grace window still counts', ctx.fetchCalls.length >= 2, 'fetches: ' + ctx.fetchCalls.length);
+  }
+
+  console.log('\n== T22: the STALL path must respect the first-fill window too ==');
+  {
+    vclock = 0;
+    const store = makeStore();
+    store.setItem('bcdn:winner:v3', JSON.stringify({ host: HOST_PREFER, kbps: 5000, ts: Date.now() }));
+    const ctx = newCtx(store, { [HOST_PREFER]: BURST_THEN_CRAWL, [HOST_FAST]: UNIFORM_FAST });
+    ctx.__bufferAhead = 0.4;   // still filling, never healthy, so never armed
+    ctx.window.__playinfo__ = payload();
+    await sleep(1500);
+    // 'waiting' events during the initial fill are normal. Guarding only the buffer path left
+    // this one wide open, and it is the easier of the two to trigger.
+    ctx.__fire('waiting', 3);
+    await sleep(1500);
+    ok('stalls during the first fill do not probe', ctx.fetchCalls.length === 0, 'fetches: ' + ctx.fetchCalls.length);
+    ok('no host was banned during the first fill', !ctx.__logs.some(l => l.includes('暂时屏蔽')), ctx.__logs.filter(l => l.includes('屏蔽')).join(' | '));
+    ok('and no reload badge was raised', !(ctx.__lastToast || '').includes('点这里刷新'), ctx.__lastToast);
+  }
+
+  console.log('\n== T23: a playback that is bad from the first second is still checked eventually ==');
+  {
+    vclock = 0;
+    const store = makeStore();
+    store.setItem('bcdn:winner:v3', JSON.stringify({ host: HOST_PREFER, kbps: 5000, ts: Date.now() }));
+    const ctx = newCtx(store, { [HOST_PREFER]: BURST_THEN_CRAWL, [HOST_FAST]: UNIFORM_FAST });
+    ctx.__bufferAhead = 0.4;
+    ctx.window.__playinfo__ = payload();
+    // the guard must be a WINDOW, not "never healthy means never check": otherwise the watchdog
+    // is permanently blind to exactly the case it exists for.
+    await sleep(1500);
+    ok('still quiet inside the window', ctx.fetchCalls.length === 0, 'fetches: ' + ctx.fetchCalls.length);
+    ctx.__clockSkew = 25000;   // step past HEALTH_FIRST_FILL_MS without sleeping 20 real seconds
+    ctx.__fire('waiting', 3);
+    await sleep(1500);
+    ok('once the window has passed it does check', ctx.fetchCalls.length >= 2, 'fetches: ' + ctx.fetchCalls.length);
   }
 
   console.log(`\n==== ${pass} passed, ${fail} failed ====`);
